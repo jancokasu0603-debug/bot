@@ -170,6 +170,7 @@ textarea,input{width:100%;font:inherit;padding:8px;border:1px solid var(--line);
 textarea{font-family:ui-monospace,Menlo,monospace;font-size:13px}
 pre{background:#14181f;color:#d7dde5;padding:12px;border-radius:6px;height:340px;overflow:auto;font-size:12.5px;margin:0;white-space:pre-wrap;word-break:break-all}
 dialog{border:1px solid var(--line);border-radius:10px;width:min(440px,92vw)}
+[hidden]{display:none!important}
 #login{position:fixed;inset:0;background:var(--bg);display:grid;place-items:center;z-index:9}
 #login form{background:var(--card);padding:24px;border-radius:10px;border:1px solid var(--line);display:grid;gap:12px;width:min(320px,90vw)}
 @media(max-width:720px){.app{grid-template-columns:1fr}aside{border-right:0;border-bottom:1px solid var(--line)}}
