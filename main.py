@@ -50,16 +50,19 @@ def install(name):
     app = d / "app"
     try:
         d.mkdir(exist_ok=True)
-        if (app / ".git").exists():
-            rc = run(name, ["git", "-C", str(app), "pull"])
-        else:
-            shutil.rmtree(app, ignore_errors=True)
-            rc = run(name, ["git", "clone", "--depth", "1", b["repo"], str(app)])
-        if rc:
-            raise RuntimeError("git gagal")
+        if b["repo"].startswith("http"):
+            if (app / ".git").exists():
+                rc = run(name, ["git", "-C", str(app), "pull"])
+            else:
+                shutil.rmtree(app, ignore_errors=True)
+                rc = run(name, ["git", "clone", "--depth", "1", b["repo"], str(app)])
+            if rc:
+                raise RuntimeError("git gagal")
         if not (d / "venv").exists() and run(name, [sys.executable, "-m", "venv", str(d / "venv")]):
             raise RuntimeError("gagal bikin venv")
         req = app / "requirements.txt"
+        if not req.exists():
+            req = next(app.rglob("requirements.txt"), req)
         if req.exists() and run(name, [str(d / "venv/bin/pip"), "install", "-r", str(req)]):
             raise RuntimeError("pip install gagal")
         b["installed"] = True
@@ -354,6 +357,164 @@ def delete_bot(name: str):
     del bots[name]
     save()
     return {"ok": True}
+
+
+# ---------- Kontrol lewat Telegram ----------
+HELP = """Perintah:
+/bots - daftar bot dan statusnya
+/add nama repo [file] [KEY=VAL ...] - tambah bot
+/env nama KEY=VAL ... - ubah env
+/install nama - install atau update
+/run nama - jalankan
+/stop nama
+/restart nama
+/logs nama [jumlah baris]
+/del nama - hapus bot
+
+Kirim file .py (atau .zip / requirements.txt) dengan caption:
+/add nama KEY=VAL pip=lib1,lib2"""
+
+
+def tg(method, **p):
+    data = urllib.parse.urlencode(p).encode()
+    r = urllib.request.urlopen(f"https://api.telegram.org/bot{TG_TOKEN}/{method}", data, timeout=40)
+    return json.loads(r.read())
+
+
+def handle(text):
+    parts = text.split()
+    cmd, args = parts[0].split("@")[0].lower(), parts[1:]
+    try:
+        if cmd in ("/start", "/help"):
+            return HELP
+        if cmd == "/bots":
+            return "\n".join(f"{n}: {info(n)['status']}" for n in bots) or "Belum ada bot"
+        if cmd == "/add":
+            if len(args) < 2:
+                return "Format: /add nama repo [file] [KEY=VAL ...]"
+            rest, entry = args[2:], "main.py"
+            if rest and "=" not in rest[0]:
+                entry = rest.pop(0)
+            env = dict(a.split("=", 1) for a in rest if "=" in a)
+            add_bot(NewBot(name=args[0].lower(), repo=args[1], entry=entry, env=env))
+            return f"{args[0]} ditambah, lagi install. Cek: /logs {args[0]}"
+        if not args:
+            return "Sebutin nama bot-nya. Contoh: " + cmd + " bot1"
+        name = args[0].lower()
+        if name not in bots:
+            return "Bot tidak ada. Cek /bots"
+        if cmd == "/env":
+            bots[name]["env"].update(dict(a.split("=", 1) for a in args[1:] if "=" in a))
+            save()
+            return "Env disimpan. /restart " + name + " supaya berlaku."
+        if cmd in ("/install", "/run", "/stop", "/restart"):
+            act(name, {"/run": "start"}.get(cmd, cmd[1:]))
+            return f"{name}: {cmd[1:]} oke. Cek /logs {name}"
+        if cmd == "/logs":
+            n = int(args[1]) if len(args) > 1 else 15
+            return "\n".join(list(logs.get(name, []))[-n:]) or "Log kosong"
+        if cmd == "/del":
+            delete_bot(name)
+            return f"{name} dihapus"
+        return "Perintah tidak dikenal. /help"
+    except HTTPException as e:
+        return f"Gagal: {e.detail}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def say(t):
+    tg("sendMessage", chat_id=TG_CHAT, text=t[:4000])
+
+
+def install_and_run(name):
+    install(name)
+    b = bots[name]
+    if b.get("installed") and (BOTS / name / "app" / b["entry"]).exists():
+        try:
+            stop(name, "running")
+            b["next_try"] = 0
+            start(name)
+            say(f"✅ {name} jalan. Cek /logs {name}")
+        except Exception as e:
+            say(f"❌ {name} gagal jalan: {e}")
+    elif b.get("installed"):
+        say(f"{name}: requirements terpasang. Kirim file .py bot-nya.")
+
+
+def handle_doc(m):
+    cap = m.get("caption", "").split()
+    if len(cap) < 2 or cap[0].split("@")[0].lower() != "/add":
+        return "Kirim file dengan caption: /add nama [KEY=VAL ...] [pip=lib1,lib2]"
+    name = cap[1].lower()
+    if not NAME_RE.match(name):
+        return "Nama: huruf kecil, angka, - atau _ (maks 32)"
+    if name in busy:
+        return "Masih install, tunggu dulu."
+    env, pips = {}, []
+    for a in cap[2:]:
+        if a.startswith("pip="):
+            pips += [x for x in a[4:].split(",") if x]
+        elif "=" in a:
+            k, v = a.split("=", 1)
+            env[k] = v
+    doc = m["document"]
+    fname = os.path.basename(doc.get("file_name") or "file").replace(" ", "_")
+    low = fname.lower()
+    path = tg("getFile", file_id=doc["file_id"])["result"]["file_path"]
+    content = urllib.request.urlopen(f"https://api.telegram.org/file/bot{TG_TOKEN}/{path}", timeout=60).read()
+    d = BOTS / name
+    app_dir = d / "app"
+    app_dir.mkdir(parents=True, exist_ok=True)
+    b = bots.setdefault(name, {"repo": "(upload)", "entry": "main.py", "env": {}, "desired": "stopped"})
+    b["env"].update(env)
+    if low.endswith(".zip"):
+        zp = d / "upload.zip"
+        zp.write_bytes(content)
+        shutil.unpack_archive(str(zp), str(app_dir), "zip")
+        pys = sorted(app_dir.rglob("*.py"), key=lambda p: (p.name not in ("main.py", "bot.py", "app.py"), len(p.parts)))
+        if not pys:
+            return "Gak ada file .py di zip itu"
+        b["entry"] = str(pys[0].relative_to(app_dir))
+    elif low.endswith(".py"):
+        (app_dir / fname).write_bytes(content)
+        b["entry"] = fname
+    elif low.endswith(".txt"):
+        (app_dir / "requirements.txt").write_bytes(content)
+    else:
+        return "Kirim .py, .zip, atau requirements.txt"
+    if pips:
+        with open(app_dir / "requirements.txt", "a") as f:
+            f.write("\n" + "\n".join(pips) + "\n")
+    save()
+    busy.add(name)
+    threading.Thread(target=install_and_run, args=(name,), daemon=True).start()
+    return f"{name} diterima, lagi install dan dijalanin. Cek /logs {name}"
+
+
+def tg_loop():
+    offset = 0
+    while True:
+        try:
+            for u in tg("getUpdates", offset=offset, timeout=30).get("result", []):
+                offset = u["update_id"] + 1
+                m = u.get("message") or {}
+                text = m.get("text") or m.get("caption") or ""
+                if str(m.get("chat", {}).get("id")) != str(TG_CHAT) or not text:
+                    continue
+                reply = handle_doc(m) if m.get("document") else handle(text)
+                if text.startswith(("/add", "/env")):
+                    try:
+                        tg("deleteMessage", chat_id=TG_CHAT, message_id=m["message_id"])
+                    except Exception:
+                        pass
+                tg("sendMessage", chat_id=TG_CHAT, text=reply[:4000])
+        except Exception:
+            time.sleep(5)
+
+
+if TG_TOKEN and TG_CHAT:
+    threading.Thread(target=tg_loop, daemon=True).start()
 
 
 if __name__ == "__main__":
