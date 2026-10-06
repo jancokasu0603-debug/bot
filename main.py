@@ -371,8 +371,8 @@ HELP = """Perintah:
 /logs nama [jumlah baris]
 /del nama - hapus bot
 
-Kirim file .py (atau .zip / requirements.txt) dengan caption:
-/add nama KEY=VAL pip=lib1,lib2"""
+Kirim file .py (atau .zip) ke chat ini, nanti gue tanya satu-satu.
+/batal - batalin proses tambah bot"""
 
 
 def tg(method, **p):
@@ -423,8 +423,43 @@ def handle(text):
         return f"Error: {e}"
 
 
-def say(t):
-    tg("sendMessage", chat_id=TG_CHAT, text=t[:4000])
+PIPMAP = {"telebot": "pyTelegramBotAPI", "telegram": "python-telegram-bot", "dotenv": "python-dotenv",
+          "PIL": "Pillow", "bs4": "beautifulsoup4", "yaml": "PyYAML", "cv2": "opencv-python-headless",
+          "sklearn": "scikit-learn", "dateutil": "python-dateutil", "jwt": "PyJWT", "Crypto": "pycryptodome"}
+wiz = {}
+
+
+def say(t, buttons=None):
+    p = {"chat_id": TG_CHAT, "text": t[:4000]}
+    if buttons:
+        p["reply_markup"] = json.dumps({"inline_keyboard": [[{"text": x, "callback_data": d} for x, d in row] for row in buttons]})
+    tg("sendMessage", **p)
+
+
+def fetch_file(file_id):
+    path = tg("getFile", file_id=file_id)["result"]["file_path"]
+    return urllib.request.urlopen(f"https://api.telegram.org/file/bot{TG_TOKEN}/{path}", timeout=60).read()
+
+
+def detect_libs(content):
+    import ast
+    try:
+        tree = ast.parse(content.decode("utf-8", "ignore"))
+    except Exception:
+        return []
+    mods = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Import):
+            mods |= {a.name.split(".")[0] for a in n.names}
+        elif isinstance(n, ast.ImportFrom) and n.level == 0 and n.module:
+            mods.add(n.module.split(".")[0])
+    return [PIPMAP.get(x, x) for x in sorted(mods) if x not in sys.stdlib_module_names]
+
+
+def detect_var(content):
+    names = re.findall(r"(?:getenv|environ(?:\.get)?)\s*[\(\[]\s*[\"'](\w+)[\"']", content.decode("utf-8", "ignore"))
+    cand = [n for n in dict.fromkeys(names) if "TOKEN" in n.upper()]
+    return cand[0] if len(cand) == 1 else None
 
 
 def install_and_run(name):
@@ -442,27 +477,10 @@ def install_and_run(name):
         say(f"{name}: requirements terpasang. Kirim file .py bot-nya.")
 
 
-def handle_doc(m):
-    cap = m.get("caption", "").split()
-    if len(cap) < 2 or cap[0].split("@")[0].lower() != "/add":
-        return "Kirim file dengan caption: /add nama [KEY=VAL ...] [pip=lib1,lib2]"
-    name = cap[1].lower()
-    if not NAME_RE.match(name):
-        return "Nama: huruf kecil, angka, - atau _ (maks 32)"
+def apply_upload(name, fname, content, env, pips):
     if name in busy:
         return "Masih install, tunggu dulu."
-    env, pips = {}, []
-    for a in cap[2:]:
-        if a.startswith("pip="):
-            pips += [x for x in a[4:].split(",") if x]
-        elif "=" in a:
-            k, v = a.split("=", 1)
-            env[k] = v
-    doc = m["document"]
-    fname = os.path.basename(doc.get("file_name") or "file").replace(" ", "_")
     low = fname.lower()
-    path = tg("getFile", file_id=doc["file_id"])["result"]["file_path"]
-    content = urllib.request.urlopen(f"https://api.telegram.org/file/bot{TG_TOKEN}/{path}", timeout=60).read()
     d = BOTS / name
     app_dir = d / "app"
     app_dir.mkdir(parents=True, exist_ok=True)
@@ -492,23 +510,151 @@ def handle_doc(m):
     return f"{name} diterima, lagi install dan dijalanin. Cek /logs {name}"
 
 
+def handle_doc(m):
+    cap = m.get("caption", "").split()
+    if len(cap) < 2:
+        return "Caption: /add nama [KEY=VAL ...] [pip=lib1,lib2]"
+    name = cap[1].lower()
+    if not NAME_RE.match(name):
+        return "Nama: huruf kecil, angka, - atau _ (maks 32)"
+    env, pips = {}, []
+    for a in cap[2:]:
+        if a.startswith("pip="):
+            pips += [x for x in a[4:].split(",") if x]
+        elif "=" in a:
+            k, v = a.split("=", 1)
+            env[k] = v
+    doc = m["document"]
+    fname = os.path.basename(doc.get("file_name") or "file").replace(" ", "_")
+    return apply_upload(name, fname, fetch_file(doc["file_id"]), env, pips)
+
+
+def start_wiz(doc):
+    fname = os.path.basename(doc.get("file_name") or "file").replace(" ", "_")
+    low = fname.lower()
+    if not low.endswith((".py", ".zip", ".txt")):
+        return "Kirim file .py, .zip, atau requirements.txt"
+    content = fetch_file(doc["file_id"])
+    wiz.clear()
+    wiz.update(fname=fname, content=content, auto=[])
+    if low.endswith(".py"):
+        wiz["auto"] = detect_libs(content)
+        v = detect_var(content)
+        if v:
+            wiz["var"] = v
+    elif low.endswith(".txt"):
+        wiz.update(token=None, var=None, pips=[])
+    ask_next(f"File {fname} diterima.")
+
+
+def ask_next(prefix=""):
+    w = wiz
+    pre = prefix + "\n" if prefix else ""
+    if "name" not in w:
+        say(pre + "Mau dikasih nama apa bot ini? (huruf kecil/angka, contoh: bot1)")
+    elif "token" not in w:
+        say(pre + "Kirim token bot-nya (dari BotFather). Pesannya gue hapus otomatis. Ketik - kalau gak butuh token.")
+    elif "var" not in w:
+        say(pre + "Nama variabel token di script-nya apa? Pilih, atau ketik sendiri.",
+            [[("BOT_TOKEN", "var:BOT_TOKEN"), ("TOKEN", "var:TOKEN"), ("API_TOKEN", "var:API_TOKEN")]])
+    elif "pips" not in w:
+        if w["auto"]:
+            say(pre + "Library terdeteksi: " + ", ".join(w["auto"]) + "\nPakai ini?",
+                [[("Pakai", "pip:yes"), ("Ubah", "pip:edit"), ("Tanpa", "pip:none")]])
+        else:
+            w["pips"] = []
+            ask_next(prefix)
+    else:
+        finish_wiz()
+
+
+def finish_wiz():
+    w = dict(wiz)
+    wiz.clear()
+    env = {w["var"]: w["token"]} if w["token"] and w["var"] else {}
+    msg = apply_upload(w["name"], w["fname"], w["content"], env, w["pips"])
+    say(msg + (f"\nToken disimpan sebagai {w['var']}." if env else ""))
+
+
+def wiz_text(text):
+    w, t = wiz, text.strip()
+    if "name" not in w:
+        if not NAME_RE.match(t.lower()):
+            return say("Nama cuma boleh huruf kecil, angka, - atau _ (maks 32). Coba lagi.")
+        w["name"] = t.lower()
+    elif "token" not in w:
+        if t == "-":
+            w["token"], w["var"] = None, None
+        elif ":" not in t:
+            return say("Itu kayaknya bukan token. Contoh: 123456:ABC-xyz. Kirim ulang, atau - kalau gak butuh.")
+        else:
+            w["token"] = t
+    elif "var" not in w:
+        if not re.match(r"^\w+$", t):
+            return say("Nama variabel cuma huruf, angka, dan _. Coba lagi.")
+        w["var"] = t
+    elif "pips" not in w:
+        w["pips"] = [x.strip() for x in t.replace("\n", ",").split(",") if x.strip() and x.strip() != "-"]
+    ask_next()
+
+
+def wiz_cb(data):
+    if not wiz or ":" not in data:
+        return
+    k, v = data.split(":", 1)
+    if k == "var":
+        wiz["var"] = v
+    elif k == "pip":
+        if v == "yes":
+            wiz["pips"] = wiz["auto"]
+        elif v == "none":
+            wiz["pips"] = []
+        else:
+            return say("Ketik library-nya, pisah koma (contoh: requests,aiogram). Atau - kalau gak ada.")
+    ask_next()
+
+
 def tg_loop():
     offset = 0
     while True:
         try:
             for u in tg("getUpdates", offset=offset, timeout=30).get("result", []):
                 offset = u["update_id"] + 1
-                m = u.get("message") or {}
-                text = m.get("text") or m.get("caption") or ""
-                if str(m.get("chat", {}).get("id")) != str(TG_CHAT) or not text:
-                    continue
-                reply = handle_doc(m) if m.get("document") else handle(text)
-                if text.startswith(("/add", "/env")):
-                    try:
-                        tg("deleteMessage", chat_id=TG_CHAT, message_id=m["message_id"])
-                    except Exception:
-                        pass
-                tg("sendMessage", chat_id=TG_CHAT, text=reply[:4000])
+                try:
+                    cb = u.get("callback_query")
+                    if cb:
+                        if str(cb.get("message", {}).get("chat", {}).get("id")) == str(TG_CHAT):
+                            tg("answerCallbackQuery", callback_query_id=cb["id"])
+                            wiz_cb(cb.get("data", ""))
+                        continue
+                    m = u.get("message") or {}
+                    if str(m.get("chat", {}).get("id")) != str(TG_CHAT):
+                        continue
+                    text = m.get("text") or m.get("caption") or ""
+                    doc, reply = m.get("document"), None
+                    if doc and text.startswith("/add"):
+                        reply = handle_doc(m)
+                    elif doc:
+                        reply = start_wiz(doc)
+                    elif text.startswith("/"):
+                        if text.split()[0].split("@")[0].lower() == "/batal":
+                            wiz.clear()
+                            reply = "Dibatalin."
+                        else:
+                            reply = handle(text)
+                    elif text and wiz:
+                        wiz_text(text)
+                    elif text:
+                        reply = "Kirim file .py bot lu buat nambah bot, atau /help."
+                    if text.startswith(("/add", "/env")) or re.match(r"^\d{6,}:[\w-]{20,}$", text.strip()):
+                        try:
+                            tg("deleteMessage", chat_id=TG_CHAT, message_id=m["message_id"])
+                        except Exception:
+                            pass
+                    if reply:
+                        say(reply)
+                except Exception as e:
+                    say(f"Error: {e}")
         except Exception:
             time.sleep(5)
 
