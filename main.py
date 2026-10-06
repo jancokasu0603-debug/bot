@@ -24,7 +24,8 @@ def save():
 
 
 def log(name, line):
-    logs.setdefault(name, deque(maxlen=800)).append(line.rstrip("\n"))
+    line = re.sub(r"\d{8,10}:[A-Za-z0-9_-]{35}", "<token>", line.rstrip("\n"))
+    logs.setdefault(name, deque(maxlen=800)).append(line)
 
 
 def notify(text):
@@ -43,6 +44,31 @@ def run(name, cmd):
     for line in p.stdout:
         log(name, line)
     return p.wait()
+
+
+PIPMAP = {"telebot": "pyTelegramBotAPI", "telegram": "python-telegram-bot", "dotenv": "python-dotenv",
+          "PIL": "Pillow", "bs4": "beautifulsoup4", "yaml": "PyYAML", "cv2": "opencv-python-headless",
+          "sklearn": "scikit-learn", "dateutil": "python-dateutil", "jwt": "PyJWT", "Crypto": "pycryptodome",
+          "serial": "pyserial", "attr": "attrs", "magic": "python-magic", "OpenSSL": "pyOpenSSL", "git": "GitPython",
+          "docx": "python-docx", "dns": "dnspython", "socks": "PySocks", "psycopg2": "psycopg2-binary",
+          "MySQLdb": "mysqlclient", "Cryptodome": "pycryptodomex", "nacl": "PyNaCl", "usb": "pyusb",
+          "zmq": "pyzmq", "skimage": "scikit-image", "fitz": "PyMuPDF"}
+
+
+def autofix(name, pkg):
+    try:
+        notify(f"🔧 {name}: kurang library {pkg}, gue install otomatis")
+        d = BOTS / name
+        if run(name, [str(d / "venv/bin/pip"), "install", pkg]) == 0:
+            with open(req_path(d / "app"), "a") as f:
+                f.write("\n" + pkg + "\n")
+            bots[name]["next_try"] = 0
+            bots[name]["last_error"] = ""
+        else:
+            notify(f"❌ {name}: gagal install {pkg}")
+    finally:
+        busy.discard(name)
+        save()
 
 
 def req_path(app):
@@ -66,8 +92,13 @@ def install(name):
         if not (d / "venv").exists() and run(name, [sys.executable, "-m", "venv", str(d / "venv")]):
             raise RuntimeError("gagal bikin venv")
         req = req_path(app)
-        if req.exists() and run(name, [str(d / "venv/bin/pip"), "install", "-r", str(req)]):
-            raise RuntimeError("pip install gagal")
+        pip = str(d / "venv/bin/pip")
+        if req.exists() and run(name, [pip, "install", "-r", str(req)]):
+            log(name, "pip -r gagal, coba satu-satu...")
+            for line in req.read_text().splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    run(name, [pip, "install", line])
         b["installed"] = True
         log(name, "== install selesai ==")
     except Exception as e:
@@ -127,6 +158,15 @@ def supervisor():
         for name, b in list(bots.items()):
             if name in busy or b.get("desired") != "running" or alive(name) or not b.get("installed"):
                 continue
+            mm = re.search(r"No module named '([\w.]+)'", b.get("last_error", ""))
+            if mm:
+                mod = mm.group(1).split(".")[0]
+                fx = b.setdefault("fixes", {})
+                if fx.get(mod, 0) < 2:
+                    fx[mod] = fx.get(mod, 0) + 1
+                    busy.add(name)
+                    threading.Thread(target=autofix, args=(name, PIPMAP.get(mod, mod)), daemon=True).start()
+                    continue
             if time.time() < b.get("next_try", 0):
                 continue
             if time.time() - b.get("started_at", 0) > 300:
@@ -362,21 +402,33 @@ def delete_bot(name: str):
     return {"ok": True}
 
 
-# ---------- Kontrol lewat Telegram ----------
-HELP = """Perintah:
-/bots - daftar bot dan statusnya
-/add nama repo [file] [KEY=VAL ...] - tambah bot
-/env nama KEY=VAL ... - ubah env
-/install nama - install atau update
-/run nama - jalankan
-/stop nama
-/restart nama
-/logs nama [jumlah baris]
-/del nama - hapus bot
-/pip nama lib1 lib2 - install library
+# ---------- Bot Telegram: menu tombol, bahasa biasa, deteksi otomatis ----------
+import urllib.error
 
-Kirim file .py (atau .zip) ke chat ini, nanti gue tanya satu-satu.
-/batal - batalin proses tambah bot"""
+HELP = """Cara pakai:
+- Kirim file .py atau .zip bot lu ke chat ini. Gue deteksi library dan setting-nya, lalu pasang dan jalanin sendiri.
+- Ngomong biasa: "restart bot1", "matiin semua", "kenapa bot2 mati?", "log bot1".
+- Atau pencet menu: /menu
+
+Kalau ada library kurang, gue install otomatis lalu restart.
+/batal - batalin proses yang lagi jalan"""
+
+TOKEN_RE = r"\d{8,10}:[A-Za-z0-9_-]{35}"
+STOP = {"ke", "di", "buat", "untuk", "library", "lib", "paket", "package", "dong", "aja", "ya", "tolong", "bot", "ulang", "lagi"}
+ACTS = [
+    ("diag", r"kenapa|knp|\bkok\b|\bwhy\b|error|crash|rusak|masalah|gagal|\bmati\b|\bdown\b|diem|(gak|ga|nggak|tidak) (jalan|bisa|respon|bales|ngerespon)"),
+    ("log", r"\blogs?\b|riwayat"),
+    ("restart", r"restart|mulai ulang|ulang|reload|segarin"),
+    ("stop", r"\bstop\b|matiin|matikan|berhenti|\boff\b|hentikan"),
+    ("run", r"jalanin|jalankan|nyalain|nyalakan|hidupin|hidupkan|\bstart\b|\brun\b|\bon\b|mulai"),
+    ("del", r"hapus|delete|buang|remove"),
+    ("status", r"status|\bcek\b|check|gimana|keadaan|\binfo\b"),
+    ("list", r"daftar|\blist\b|bot apa|semua bot|punya bot|bot gue|bot gua"),
+    ("add", r"tambah|nambah|bikin bot|pasang bot|upload"),
+]
+ICON = {"running": "🟢", "stopped": "⚪", "crashed": "🔴", "installing": "🟡"}
+MAIN = [[("📋 Bot gue", "m:list"), ("➕ Tambah bot", "m:add")], [("❓ Bantuan", "m:help")]]
+state, FIX = {}, {}
 
 
 def tg(method, **p):
@@ -385,75 +437,37 @@ def tg(method, **p):
     return json.loads(r.read())
 
 
-def handle(text):
-    parts = text.split()
-    cmd, args = parts[0].split("@")[0].lower(), parts[1:]
-    try:
-        if cmd in ("/start", "/help"):
-            return HELP
-        if cmd == "/bots":
-            return "\n".join(f"{n}: {info(n)['status']}" for n in bots) or "Belum ada bot"
-        if cmd == "/add":
-            if len(args) < 2:
-                return "Format: /add nama repo [file] [KEY=VAL ...]"
-            rest, entry = args[2:], "main.py"
-            if rest and "=" not in rest[0]:
-                entry = rest.pop(0)
-            env = dict(a.split("=", 1) for a in rest if "=" in a)
-            add_bot(NewBot(name=args[0].lower(), repo=args[1], entry=entry, env=env))
-            return f"{args[0]} ditambah, lagi install. Cek: /logs {args[0]}"
-        if not args:
-            return "Sebutin nama bot-nya. Contoh: " + cmd + " bot1"
-        name = args[0].lower()
-        if name not in bots:
-            return "Bot tidak ada. Cek /bots"
-        if cmd == "/env":
-            bots[name]["env"].update(dict(a.split("=", 1) for a in args[1:] if "=" in a))
-            save()
-            return "Env disimpan. /restart " + name + " supaya berlaku."
-        if cmd == "/pip":
-            libs = [x for x in " ".join(args[1:]).replace(",", " ").split() if x]
-            if not libs:
-                return "Format: /pip nama lib1 lib2"
-            if name in busy:
-                return "Masih install, tunggu dulu."
-            with open(req_path(BOTS / name / "app"), "a") as f:
-                f.write("\n" + "\n".join(libs) + "\n")
-            busy.add(name)
-            threading.Thread(target=install_and_run, args=(name,), daemon=True).start()
-            return f"Install {' '.join(libs)} ke {name}, lalu restart. Cek /logs {name}"
-        if cmd in ("/install", "/run", "/stop", "/restart"):
-            act(name, {"/run": "start"}.get(cmd, cmd[1:]))
-            return f"{name}: {cmd[1:]} oke. Cek /logs {name}"
-        if cmd == "/logs":
-            n = int(args[1]) if len(args) > 1 else 15
-            return "\n".join(list(logs.get(name, []))[-n:]) or "Log kosong"
-        if cmd == "/del":
-            delete_bot(name)
-            return f"{name} dihapus"
-        return "Perintah tidak dikenal. /help"
-    except HTTPException as e:
-        return f"Gagal: {e.detail}"
-    except Exception as e:
-        return f"Error: {e}"
-
-
-PIPMAP = {"telebot": "pyTelegramBotAPI", "telegram": "python-telegram-bot", "dotenv": "python-dotenv",
-          "PIL": "Pillow", "bs4": "beautifulsoup4", "yaml": "PyYAML", "cv2": "opencv-python-headless",
-          "sklearn": "scikit-learn", "dateutil": "python-dateutil", "jwt": "PyJWT", "Crypto": "pycryptodome"}
-wiz = {}
-
-
-def say(t, buttons=None):
-    p = {"chat_id": TG_CHAT, "text": t[:4000]}
-    if buttons:
-        p["reply_markup"] = json.dumps({"inline_keyboard": [[{"text": x, "callback_data": d} for x, d in row] for row in buttons]})
-    tg("sendMessage", **p)
+def show(text, rows=None, mid=None):
+    p = {"chat_id": TG_CHAT, "text": text[:4000]}
+    if rows:
+        p["reply_markup"] = json.dumps({"inline_keyboard": [[{"text": a, "callback_data": b} for a, b in row] for row in rows]})
+    if mid:
+        try:
+            return tg("editMessageText", message_id=mid, **p)
+        except urllib.error.HTTPError as e:
+            if b"not modified" in e.read():
+                return
+        except Exception:
+            pass
+    return tg("sendMessage", **p)
 
 
 def fetch_file(file_id):
     path = tg("getFile", file_id=file_id)["result"]["file_path"]
     return urllib.request.urlopen(f"https://api.telegram.org/file/bot{TG_TOKEN}/{path}", timeout=60).read()
+
+
+def parse_env(text):
+    out = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.replace("export ", "").strip()
+        if re.match(r"^\w+$", k):
+            out[k] = v.strip().strip("\"'")
+    return out
 
 
 def detect_libs(content, local=()):
@@ -471,10 +485,80 @@ def detect_libs(content, local=()):
     return [PIPMAP.get(x, x) for x in sorted(mods) if x not in sys.stdlib_module_names and x not in local]
 
 
-def detect_var(content):
-    names = re.findall(r"(?:getenv|environ(?:\.get)?)\s*[\(\[]\s*[\"'](\w+)[\"']", content.decode("utf-8", "ignore"))
-    cand = [n for n in dict.fromkeys(names) if "TOKEN" in n.upper()]
-    return cand[0] if len(cand) == 1 else None
+def token_vars(text):
+    names = re.findall(r"(?:getenv|environ(?:\.get)?)\s*[\(\[]\s*[\"'](\w+)[\"']", text)
+    found = [n for n in dict.fromkeys(names) if "TOKEN" in n.upper()]
+    return found[:1] if found else ["BOT_TOKEN", "TOKEN", "TELEGRAM_BOT_TOKEN", "API_TOKEN"]
+
+
+def analyze(fname, content):
+    low, texts, libs, env = fname.lower(), "", set(), {}
+    if low.endswith(".py"):
+        texts = content.decode("utf-8", "ignore")
+        libs = set(detect_libs(content))
+    elif low.endswith(".zip"):
+        import io, zipfile
+        try:
+            z = zipfile.ZipFile(io.BytesIO(content))
+            names = [n for n in z.namelist() if not n.endswith("/") and "site-packages" not in n and "__MACOSX" not in n]
+            pys = [n for n in names if n.endswith(".py")]
+            local = {os.path.basename(n)[:-3] for n in pys} | {p for n in names for p in n.split("/")[:-1]}
+            for n in pys:
+                t = z.read(n)
+                if len(t) < 500000:
+                    libs |= set(detect_libs(t, local))
+                    texts += t.decode("utf-8", "ignore") + "\n"
+            for n in names:
+                if os.path.basename(n) == ".env":
+                    env.update(parse_env(z.read(n).decode("utf-8", "ignore")))
+        except Exception:
+            pass
+    has_token = bool(re.search(TOKEN_RE, texts)) or any("TOKEN" in k.upper() and v for k, v in env.items())
+    return {"libs": sorted(libs), "env": env, "tvars": token_vars(texts), "has_token": has_token}
+
+
+def derive_name(fname):
+    return re.sub(r"[^a-z0-9_-]+", "-", os.path.splitext(fname)[0].lower()).strip("-")[:32] or "bot"
+
+
+def apply_upload(name, fname, content, env, pips, tvars=None):
+    if name in busy:
+        return "Masih install, tunggu dulu."
+    low = fname.lower()
+    d = BOTS / name
+    app_dir = d / "app"
+    app_dir.mkdir(parents=True, exist_ok=True)
+    b = bots.setdefault(name, {"repo": "(upload)", "entry": "main.py", "env": {}, "desired": "stopped"})
+    b["env"].update(env)
+    if tvars:
+        b["tvars"] = tvars
+    if low.endswith(".zip"):
+        zp = d / "upload.zip"
+        zp.write_bytes(content)
+        shutil.unpack_archive(str(zp), str(app_dir), "zip")
+        pys = sorted(app_dir.rglob("*.py"), key=lambda p: (p.name not in ("main.py", "bot.py", "app.py"), len(p.parts)))
+        if not pys:
+            return "Gak ada file .py di zip itu."
+        b["entry"] = str(pys[0].relative_to(app_dir))
+    elif low.endswith(".py"):
+        (app_dir / fname).write_bytes(content)
+        b["entry"] = fname
+    elif low.endswith(".txt"):
+        (app_dir / "requirements.txt").write_bytes(content)
+    if pips:
+        req = req_path(app_dir)
+        have = set()
+        if req.exists():
+            have = {re.split(r"[<>=!~\[; ]", l.strip(), maxsplit=1)[0].lower().replace("_", "-")
+                    for l in req.read_text().splitlines() if l.strip() and not l.startswith("#")}
+        new = [p for p in pips if p.lower().replace("_", "-") not in have]
+        if new:
+            with open(req, "a") as f:
+                f.write("\n" + "\n".join(new) + "\n")
+    save()
+    busy.add(name)
+    threading.Thread(target=install_and_run, args=(name,), daemon=True).start()
+    return None
 
 
 def install_and_run(name):
@@ -485,166 +569,346 @@ def install_and_run(name):
             stop(name, "running")
             b["next_try"] = 0
             start(name)
-            say(f"✅ {name} jalan. Cek /logs {name}")
+            show(f"✅ {name} jalan.", [[("Buka bot", f"b:{name}"), ("📜 Log", f"a:log:{name}")]])
         except Exception as e:
-            say(f"❌ {name} gagal jalan: {e}")
+            show(f"❌ {name} gagal jalan: {e}")
     elif b.get("installed"):
-        say(f"{name}: requirements terpasang. Kirim file .py bot-nya.")
+        show(f"{name}: requirements terpasang.")
 
 
-def apply_upload(name, fname, content, env, pips):
+def emoji(name):
+    return ICON.get(info(name)["status"], "⚪")
+
+
+def main_menu(mid=None):
+    show("Mau ngapain? 👇", MAIN, mid)
+
+
+def list_view(mid=None):
+    if not bots:
+        return show("Belum ada bot. Kirim file .py atau .zip bot lu ke sini, gue pasang otomatis.", [[("⬅️ Menu", "m:main")]], mid)
+    rows = [[(f"{emoji(n)} {n}", f"b:{n}")] for n in bots] + [[("⬅️ Menu", "m:main")]]
+    show("Pilih bot:", rows, mid)
+
+
+def bot_view(name, mid=None, note=""):
+    i = info(name)
+    t = f"{ICON.get(i['status'], '⚪')} {name} ({i['status']})"
+    if i["ram_mb"] is not None:
+        t += f"\nRAM {i['ram_mb']} MB, aktif {(i['uptime'] or 0) // 60} menit"
+    if i["restarts"]:
+        t += f"\nRestart otomatis: {i['restarts']}x"
+    if i["last_error"]:
+        t += f"\nError terakhir: {i['last_error'][:150]}"
+    if note:
+        t = note + "\n\n" + t
+    rows = [[("▶️ Jalanin", f"a:run:{name}"), ("⏹ Stop", f"a:stop:{name}"), ("🔄 Restart", f"a:restart:{name}")],
+            [("📜 Log", f"a:log:{name}"), ("🩺 Cek masalah", f"a:diag:{name}")],
+            [("📦 Library", f"a:pip:{name}"), ("⚙️ Env", f"a:env:{name}"), ("🔑 Token", f"a:tok:{name}")],
+            [("🗑 Hapus", f"a:del:{name}"), ("⬅️ Kembali", "m:list")]]
+    show(t, rows, mid)
+
+
+def do(name, action, mid=None, note=None):
+    try:
+        act(name, {"run": "start"}.get(action, action))
+    except HTTPException as e:
+        return bot_view(name, mid, f"⚠️ {e.detail}")
+    bot_view(name, mid, note or {"run": "▶️ Dijalanin", "stop": "⏹ Dihentikan", "restart": "🔄 Direstart"}[action])
+
+
+def log_view(name, mid=None):
+    body = "\n".join(list(logs.get(name, []))[-20:])[-3500:] or "Log kosong"
+    show(f"📜 {name}\n{body}", [[("↻ Refresh", f"a:log:{name}"), ("⬅️ Bot", f"b:{name}")]], mid)
+
+
+def diag_view(name, mid=None):
+    b, i = bots[name], info(name)
+    blob = "\n".join(list(logs.get(name, []))[-40:]) + "\n" + b.get("last_error", "")
+    tips, rows = [], []
+    m = re.search(r"No module named '([\w.]+)'", blob)
+    if m:
+        mod = m.group(1).split(".")[0]
+        FIX[name] = PIPMAP.get(mod, mod)
+        tips.append(f"Library {FIX[name]} belum terpasang.")
+        rows.append([(f"📦 Install {FIX[name]}", f"a:fix:{name}")])
+    if re.search(r"Unauthorized|InvalidToken|Invalid token", blob):
+        tips.append("Token ditolak Telegram (salah atau udah di-revoke).")
+        rows.append([("🔑 Ganti token", f"a:tok:{name}")])
+    if re.search(r"terminated by other getUpdates", blob):
+        tips.append("Token ini lagi dipakai di tempat lain (bot jalan dobel). Matiin yang satunya.")
+    k = re.search(r"KeyError: '(\w+)'", blob)
+    if k:
+        tips.append(f"Variabel {k.group(1)} belum diisi.")
+        rows.append([("⚙️ Isi env", f"a:env:{name}")])
+    if re.search(r"NetworkError|TimedOut|ConnectError|ConnectionError", blob):
+        tips.append("Koneksi ke Telegram lagi bermasalah, biasanya sementara.")
+    if re.search(r"SyntaxError|IndentationError", blob):
+        tips.append("Ada salah tulis di kode script (SyntaxError), perlu diperbaiki di filenya.")
+    if not tips:
+        if i["status"] == "running":
+            tips.append("Bot hidup dan nyambung. Kalau gak bales, kemungkinan logika script-nya (perintah yang dikenal, ID admin, atau env belum diisi).")
+        elif b.get("last_error"):
+            tips.append("Error terakhir: " + b["last_error"][:200])
+        else:
+            tips.append("Gak ada error di log.")
+    rows += [[("🔄 Restart", f"a:restart:{name}"), ("📜 Log", f"a:log:{name}")], [("⬅️ Bot", f"b:{name}")]]
+    show(f"🩺 {name} ({i['status']})\n\n" + "\n".join("• " + t for t in tips), rows, mid)
+
+
+def pip_libs(name, libs):
+    if not libs:
+        return show("Format: /pip nama lib1 lib2")
     if name in busy:
-        return "Masih install, tunggu dulu."
-    low = fname.lower()
-    d = BOTS / name
-    app_dir = d / "app"
-    app_dir.mkdir(parents=True, exist_ok=True)
-    b = bots.setdefault(name, {"repo": "(upload)", "entry": "main.py", "env": {}, "desired": "stopped"})
-    b["env"].update(env)
-    if low.endswith(".zip"):
-        zp = d / "upload.zip"
-        zp.write_bytes(content)
-        shutil.unpack_archive(str(zp), str(app_dir), "zip")
-        pys = sorted(app_dir.rglob("*.py"), key=lambda p: (p.name not in ("main.py", "bot.py", "app.py"), len(p.parts)))
-        if not pys:
-            return "Gak ada file .py di zip itu"
-        b["entry"] = str(pys[0].relative_to(app_dir))
-    elif low.endswith(".py"):
-        (app_dir / fname).write_bytes(content)
-        b["entry"] = fname
-    elif low.endswith(".txt"):
-        (app_dir / "requirements.txt").write_bytes(content)
-    else:
-        return "Kirim .py, .zip, atau requirements.txt"
-    if pips:
-        with open(req_path(app_dir), "a") as f:
-            f.write("\n" + "\n".join(pips) + "\n")
-    save()
+        return show("Masih install, tunggu dulu.")
+    with open(req_path(BOTS / name / "app"), "a") as f:
+        f.write("\n" + "\n".join(libs) + "\n")
     busy.add(name)
     threading.Thread(target=install_and_run, args=(name,), daemon=True).start()
-    return f"{name} diterima, lagi install dan dijalanin. Cek /logs {name}"
+    show(f"📦 Install {', '.join(libs)} ke {name}, lalu restart.", [[("⬅️ Bot", f"b:{name}")]])
 
 
-def handle_doc(m):
-    cap = m.get("caption", "").split()
-    if len(cap) < 2:
-        return "Caption: /add nama [KEY=VAL ...] [pip=lib1,lib2]"
-    name = cap[1].lower()
-    if not NAME_RE.match(name):
-        return "Nama: huruf kecil, angka, - atau _ (maks 32)"
-    env, pips = {}, []
-    for a in cap[2:]:
-        if a.startswith("pip="):
-            pips += [x for x in a[4:].split(",") if x]
-        elif "=" in a:
-            k, v = a.split("=", 1)
-            env[k] = v
+def go(name, fname, content, env, pips, tvars, token=None):
+    if token:
+        for v in tvars:
+            env[v] = token
+    err = apply_upload(name, fname, content, env, pips, tvars)
+    if err:
+        return show(err, MAIN)
+    lib = "dari requirements.txt" if fname == "requirements.txt" else (", ".join(pips) or "gak ada tambahan")
+    show(f"✅ {name} ditambah\n📦 Library: {lib}\n🔑 Env: {', '.join(env) or '-'}\n\nLagi install dan jalanin. Kalau ada library kurang, gue install sendiri.",
+         [[("Buka bot", f"b:{name}"), ("📜 Log", f"a:log:{name}")]])
+
+
+def on_file(m):
     doc = m["document"]
-    fname = os.path.basename(doc.get("file_name") or "file").replace(" ", "_")
-    return apply_upload(name, fname, fetch_file(doc["file_id"]), env, pips)
-
-
-def start_wiz(doc):
     fname = os.path.basename(doc.get("file_name") or "file").replace(" ", "_")
     low = fname.lower()
     if not low.endswith((".py", ".zip", ".txt")):
-        return "Kirim file .py, .zip, atau requirements.txt"
+        return show("Kirim file .py, .zip, atau requirements.txt ya.", MAIN)
+    cap = (m.get("caption") or "").split()
+    if cap and cap[0].split("@")[0].lower() == "/add":
+        cap = cap[1:]
+    name, env, pips, token = None, {}, [], None
+    for w in cap:
+        if w.startswith("pip="):
+            pips += [x for x in w[4:].split(",") if x]
+        elif "=" in w:
+            k, v = w.split("=", 1)
+            env[k] = v
+        elif re.search(TOKEN_RE, w):
+            token = re.search(TOKEN_RE, w).group(0)
+        elif NAME_RE.match(w.lower()) and not name:
+            name = w.lower()
     content = fetch_file(doc["file_id"])
-    wiz.clear()
-    wiz.update(fname=fname, content=content, auto=[])
-    if low.endswith(".py"):
-        wiz["auto"] = detect_libs(content)
-        v = detect_var(content)
-        if v:
-            wiz["var"] = v
-    elif low.endswith(".zip"):
-        import io, zipfile
-        try:
-            z = zipfile.ZipFile(io.BytesIO(content))
-            names = [n for n in z.namelist() if not n.endswith("/")]
-            pys = [n for n in names if n.endswith(".py")]
-            local = {os.path.basename(n)[:-3] for n in pys} | {p for n in names for p in n.split("/")[:-1]}
-            libs, texts = set(), ""
-            for n in pys:
-                t = z.read(n)
-                libs |= set(detect_libs(t, local))
-                texts += t.decode("utf-8", "ignore") + "\n"
-            wiz["auto"] = sorted(libs)
-            v = detect_var(texts.encode())
-            if v:
-                wiz["var"] = v
-        except Exception:
-            pass
-    elif low.endswith(".txt"):
-        wiz.update(token=None, var=None, pips=[])
-    ask_next(f"File {fname} diterima.")
+    if low.endswith(".txt"):
+        target = name or (list(bots)[0] if len(bots) == 1 else None)
+        if target in bots:
+            return go(target, "requirements.txt", content, {}, [], None)
+        if not bots:
+            return show("Belum ada bot buat requirements ini. Kirim file bot-nya dulu.", MAIN)
+        state.clear()
+        state.update(kind="req", content=content)
+        return show("Requirements ini buat bot yang mana?", [[(n, f"r:{n}")] for n in bots] + [[("Batal", "m:cancel")]])
+    an = analyze(fname, content)
+    name = name or derive_name(fname)
+    if name in bots and bots[name]["repo"] != "(upload)":
+        name += "-up"
+    env = {**an["env"], **env}
+    pips = list(dict.fromkeys(an["libs"] + pips))
+    if not token and not an["has_token"] and not any("TOKEN" in k.upper() for k in env):
+        state.clear()
+        state.update(kind="token", name=name, fname=fname, content=content, env=env, pips=pips, tvars=an["tvars"])
+        return show(f"📥 {fname} diterima. Bot-nya gue namain {name}.\nSisa 1 hal: kirim token bot-nya (dari BotFather).",
+                    [[("Lewati, gak butuh token", "t:skip"), ("Batal", "m:cancel")]])
+    go(name, fname, content, env, pips, an["tvars"], token)
 
 
-def ask_next(prefix=""):
-    w = wiz
-    pre = prefix + "\n" if prefix else ""
-    if "name" not in w:
-        say(pre + "Mau dikasih nama apa bot ini? (huruf kecil/angka, contoh: bot1)")
-    elif "token" not in w:
-        say(pre + "Kirim token bot-nya (dari BotFather). Pesannya gue hapus otomatis. Ketik - kalau gak butuh token.")
-    elif "var" not in w:
-        say(pre + "Nama variabel token di script-nya apa? Pilih, atau ketik sendiri.",
-            [[("BOT_TOKEN", "var:BOT_TOKEN"), ("TOKEN", "var:TOKEN"), ("API_TOKEN", "var:API_TOKEN")]])
-    elif "pips" not in w:
-        if w["auto"]:
-            say(pre + "Library terdeteksi: " + ", ".join(w["auto"]) + "\nPakai ini?",
-                [[("Pakai", "pip:yes"), ("Ubah", "pip:edit"), ("Tanpa", "pip:none")]])
+def finish_token(token):
+    s = dict(state)
+    state.clear()
+    go(s["name"], s["fname"], s["content"], s["env"], s["pips"], s["tvars"], token)
+
+
+def state_text(text):
+    t, kind, name = text.strip(), state.get("kind"), state.get("name")
+    if t.lower() in ("batal", "cancel"):
+        state.clear()
+        return show("Dibatalin.", MAIN)
+    if kind in ("token", "tok"):
+        if not re.match(r"^\d+:[\w-]+$", t):
+            return show("Itu kayaknya bukan token. Contoh: 123456:ABC-xyz. Kirim ulang, atau pencet Batal.",
+                        [[("Batal", "m:cancel")]])
+        if kind == "token":
+            return finish_token(t)
+        for v in bots[name].get("tvars") or ["BOT_TOKEN"]:
+            bots[name]["env"][v] = t
+        save()
+        state.clear()
+        return do(name, "restart", None, "🔑 Token diganti.")
+    if kind == "pip":
+        state.clear()
+        return pip_libs(name, [x for x in t.replace(",", " ").split() if x])
+    if kind == "env":
+        pairs = dict(x.split("=", 1) for x in t.split() if "=" in x)
+        state.clear()
+        if not pairs:
+            return show("Format: KEY=VALUE (boleh banyak, pisah spasi).", [[("⬅️ Bot", f"b:{name}")]])
+        bots[name]["env"].update(pairs)
+        save()
+        return do(name, "restart", None, "⚙️ Env disimpan.")
+    state.clear()
+    nlu(text)
+
+
+def action(a, name, mid=None):
+    if a in ("run", "stop", "restart"):
+        do(name, a, mid)
+    elif a == "status":
+        bot_view(name, mid)
+    elif a == "log":
+        log_view(name, mid)
+    elif a == "diag":
+        diag_view(name, mid)
+    elif a in ("pip", "env", "tok"):
+        state.clear()
+        state.update(kind=a, name=name)
+        prompt = {"pip": "Ketik library yang mau dipasang (pisah koma/spasi). Contoh: requests aiogram",
+                  "env": "Kirim isi env: KEY=VALUE (boleh banyak, pisah spasi). Pesannya gue hapus.",
+                  "tok": "Kirim token baru dari BotFather. Pesannya gue hapus."}[a]
+        show(f"{name}: {prompt}", [[("Batal", f"c:{name}")]], mid)
+    elif a == "del":
+        show(f"Yakin hapus {name} beserta filenya?", [[("Ya, hapus", f"a:delok:{name}"), ("Batal", f"b:{name}")]], mid)
+    elif a == "delok":
+        delete_bot(name)
+        list_view(mid)
+    elif a == "fix":
+        pkg = FIX.get(name)
+        if not pkg or name in busy:
+            return bot_view(name, mid, "Masih sibuk atau gak ada yang diperbaiki.")
+        busy.add(name)
+        threading.Thread(target=autofix, args=(name, pkg), daemon=True).start()
+        bot_view(name, mid, f"🔧 Install {pkg}, nanti otomatis jalan lagi.")
+
+
+def nlu(text):
+    t = text.lower().strip()
+    if re.fullmatch(r"(halo|hai|hi|menu|start|p|woi|oi|tes|test)\W*", t):
+        return main_menu()
+    names = [n for n in bots if re.search(rf"(?<![\w-]){re.escape(n)}(?![\w-])", t)]
+    m = re.search(r"\b(?:install|pip)\s+([\w\-.=<>, ]+)", t)
+    if m and names:
+        words = [w for w in re.split(r"[\s,]+", m.group(1)) if w and w not in names and w not in STOP]
+        if words:
+            return pip_libs(names[0], words)
+    a = next((x for x, rx in ACTS if re.search(rx, t)), None)
+    if a == "add":
+        return show("Kirim aja file .py atau .zip bot lu ke chat ini, gue pasang otomatis.", MAIN)
+    if a == "list" and not names:
+        return list_view()
+    allw = bool(re.search(r"\b(semua|semuanya|all)\b", t))
+    if not names:
+        if a is None or not bots:
+            return show("Gue belum nangkep 😅 Coba pencet menu, atau kirim file bot lu langsung.", MAIN)
+        if allw and a in ("run", "stop", "restart"):
+            names = list(bots)
+        elif len(bots) == 1:
+            names = list(bots)
         else:
-            w["pips"] = []
-            ask_next(prefix)
-    else:
-        finish_wiz()
+            return show("Bot yang mana?", [[(f"{emoji(n)} {n}", f"a:{a}:{n}")] for n in list(bots)[:20]])
+    n = names[0]
+    if a in ("run", "stop", "restart"):
+        if len(names) > 1:
+            res = []
+            for x in names:
+                try:
+                    act(x, {"run": "start"}.get(a, a))
+                    res.append(f"{x}: ok")
+                except HTTPException as e:
+                    res.append(f"{x}: {e.detail}")
+            return show("\n".join(res), [[("📋 Bot gue", "m:list")]])
+        return do(n, a)
+    if a in ("diag", "log", "del"):
+        return action(a, n)
+    bot_view(n)
 
 
-def finish_wiz():
-    w = dict(wiz)
-    wiz.clear()
-    env = {w["var"]: w["token"]} if w["token"] and w["var"] else {}
-    msg = apply_upload(w["name"], w["fname"], w["content"], env, w["pips"])
-    say(msg + (f"\nToken disimpan sebagai {w['var']}." if env else ""))
+def command(text):
+    parts = text.split()
+    cmd, args = parts[0].split("@")[0].lower(), parts[1:]
+    if cmd in ("/start", "/menu"):
+        return main_menu()
+    if cmd == "/help":
+        return show(HELP, [[("⬅️ Menu", "m:main")]])
+    if cmd == "/bots":
+        return list_view()
+    if cmd == "/batal":
+        state.clear()
+        return show("Dibatalin.", MAIN)
+    try:
+        if cmd == "/add":
+            if len(args) < 2:
+                return show("Format: /add nama repo [file] [KEY=VAL ...]\nAtau kirim file .py/.zip langsung.")
+            rest, entry = args[2:], "main.py"
+            if rest and "=" not in rest[0]:
+                entry = rest.pop(0)
+            env = dict(a.split("=", 1) for a in rest if "=" in a)
+            add_bot(NewBot(name=args[0].lower(), repo=args[1], entry=entry, env=env))
+            return show(f"{args[0]} ditambah, lagi install. Cek: /logs {args[0]}")
+        if not args:
+            return show("Sebutin nama bot-nya. Contoh: " + cmd + " bot1")
+        name = args[0].lower()
+        if name not in bots:
+            return show("Bot tidak ada. Cek /bots")
+        if cmd in ("/run", "/stop", "/restart"):
+            return do(name, cmd[1:])
+        if cmd == "/logs":
+            return log_view(name)
+        if cmd == "/pip":
+            return pip_libs(name, [x for x in " ".join(args[1:]).replace(",", " ").split() if x])
+        if cmd == "/env":
+            bots[name]["env"].update(dict(a.split("=", 1) for a in args[1:] if "=" in a))
+            save()
+            return show(f"Env disimpan. /restart {name} supaya berlaku.")
+        if cmd == "/install":
+            act(name, "install")
+            return show(f"{name}: install dimulai. Cek /logs {name}")
+        if cmd == "/del":
+            delete_bot(name)
+            return show(f"{name} dihapus", MAIN)
+        show("Perintah tidak dikenal. Coba /menu")
+    except HTTPException as e:
+        show(f"Gagal: {e.detail}")
 
 
-def wiz_text(text):
-    w, t = wiz, text.strip()
-    if "name" not in w:
-        if not NAME_RE.match(t.lower()):
-            return say("Nama cuma boleh huruf kecil, angka, - atau _ (maks 32). Coba lagi.")
-        w["name"] = t.lower()
-    elif "token" not in w:
-        if t == "-":
-            w["token"], w["var"] = None, None
-        elif ":" not in t:
-            return say("Itu kayaknya bukan token. Contoh: 123456:ABC-xyz. Kirim ulang, atau - kalau gak butuh.")
-        else:
-            w["token"] = t
-    elif "var" not in w:
-        if not re.match(r"^\w+$", t):
-            return say("Nama variabel cuma huruf, angka, dan _. Coba lagi.")
-        w["var"] = t
-    elif "pips" not in w:
-        w["pips"] = [x.strip() for x in t.replace("\n", ",").split(",") if x.strip() and x.strip() != "-"]
-    ask_next()
-
-
-def wiz_cb(data):
-    if not wiz or ":" not in data:
-        return
-    k, v = data.split(":", 1)
-    if k == "var":
-        wiz["var"] = v
-    elif k == "pip":
-        if v == "yes":
-            wiz["pips"] = wiz["auto"]
-        elif v == "none":
-            wiz["pips"] = []
-        else:
-            return say("Ketik library-nya, pisah koma (contoh: requests,aiogram). Atau - kalau gak ada.")
-    ask_next()
+def on_callback(cb):
+    mid = cb["message"]["message_id"]
+    k = cb.get("data", "").split(":")
+    if k[0] == "m":
+        if k[1] == "main":
+            main_menu(mid)
+        elif k[1] == "list":
+            list_view(mid)
+        elif k[1] == "add":
+            show("Kirim file .py atau .zip bot lu ke chat ini. Gue deteksi library dan setting-nya, lalu jalanin otomatis.", [[("⬅️ Menu", "m:main")]], mid)
+        elif k[1] == "help":
+            show(HELP, [[("⬅️ Menu", "m:main")]], mid)
+        elif k[1] == "cancel":
+            state.clear()
+            main_menu(mid)
+    elif k[0] == "b" and k[1] in bots:
+        bot_view(k[1], mid)
+    elif k[0] == "c" and k[1] in bots:
+        state.clear()
+        bot_view(k[1], mid)
+    elif k[0] == "a" and len(k) >= 3 and k[2] in bots:
+        action(k[1], k[2], mid)
+    elif k[0] == "t" and state.get("kind") == "token":
+        finish_token(None)
+    elif k[0] == "r" and state.get("kind") == "req" and k[1] in bots:
+        content = state["content"]
+        state.clear()
+        go(k[1], "requirements.txt", content, {}, [], None)
 
 
 def tg_loop():
@@ -656,38 +920,30 @@ def tg_loop():
                 try:
                     cb = u.get("callback_query")
                     if cb:
-                        if str(cb.get("message", {}).get("chat", {}).get("id")) == str(TG_CHAT):
+                        if str(cb["message"]["chat"]["id"]) == str(TG_CHAT):
                             tg("answerCallbackQuery", callback_query_id=cb["id"])
-                            wiz_cb(cb.get("data", ""))
+                            on_callback(cb)
                         continue
                     m = u.get("message") or {}
                     if str(m.get("chat", {}).get("id")) != str(TG_CHAT):
                         continue
                     text = m.get("text") or m.get("caption") or ""
-                    doc, reply = m.get("document"), None
-                    if doc and text.startswith("/add"):
-                        reply = handle_doc(m)
-                    elif doc:
-                        reply = start_wiz(doc)
+                    secret = bool(re.search(TOKEN_RE, text)) or text.startswith(("/add", "/env")) or state.get("kind") in ("token", "env", "tok")
+                    if m.get("document"):
+                        on_file(m)
                     elif text.startswith("/"):
-                        if text.split()[0].split("@")[0].lower() == "/batal":
-                            wiz.clear()
-                            reply = "Dibatalin."
-                        else:
-                            reply = handle(text)
-                    elif text and wiz:
-                        wiz_text(text)
+                        command(text)
+                    elif state:
+                        state_text(text)
                     elif text:
-                        reply = "Kirim file .py bot lu buat nambah bot, atau /help."
-                    if text.startswith(("/add", "/env")) or re.match(r"^\d{6,}:[\w-]{20,}$", text.strip()):
+                        nlu(text)
+                    if secret and text:
                         try:
                             tg("deleteMessage", chat_id=TG_CHAT, message_id=m["message_id"])
                         except Exception:
                             pass
-                    if reply:
-                        say(reply)
                 except Exception as e:
-                    say(f"Error: {e}")
+                    show(f"Error: {e}")
         except Exception:
             time.sleep(5)
 
