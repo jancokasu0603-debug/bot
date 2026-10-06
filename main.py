@@ -45,6 +45,11 @@ def run(name, cmd):
     return p.wait()
 
 
+def req_path(app):
+    r = app / "requirements.txt"
+    return r if r.exists() else next(app.rglob("requirements.txt"), r)
+
+
 def install(name):
     b, d = bots[name], BOTS / name
     app = d / "app"
@@ -60,9 +65,7 @@ def install(name):
                 raise RuntimeError("git gagal")
         if not (d / "venv").exists() and run(name, [sys.executable, "-m", "venv", str(d / "venv")]):
             raise RuntimeError("gagal bikin venv")
-        req = app / "requirements.txt"
-        if not req.exists():
-            req = next(app.rglob("requirements.txt"), req)
+        req = req_path(app)
         if req.exists() and run(name, [str(d / "venv/bin/pip"), "install", "-r", str(req)]):
             raise RuntimeError("pip install gagal")
         b["installed"] = True
@@ -370,6 +373,7 @@ HELP = """Perintah:
 /restart nama
 /logs nama [jumlah baris]
 /del nama - hapus bot
+/pip nama lib1 lib2 - install library
 
 Kirim file .py (atau .zip) ke chat ini, nanti gue tanya satu-satu.
 /batal - batalin proses tambah bot"""
@@ -407,6 +411,17 @@ def handle(text):
             bots[name]["env"].update(dict(a.split("=", 1) for a in args[1:] if "=" in a))
             save()
             return "Env disimpan. /restart " + name + " supaya berlaku."
+        if cmd == "/pip":
+            libs = [x for x in " ".join(args[1:]).replace(",", " ").split() if x]
+            if not libs:
+                return "Format: /pip nama lib1 lib2"
+            if name in busy:
+                return "Masih install, tunggu dulu."
+            with open(req_path(BOTS / name / "app"), "a") as f:
+                f.write("\n" + "\n".join(libs) + "\n")
+            busy.add(name)
+            threading.Thread(target=install_and_run, args=(name,), daemon=True).start()
+            return f"Install {' '.join(libs)} ke {name}, lalu restart. Cek /logs {name}"
         if cmd in ("/install", "/run", "/stop", "/restart"):
             act(name, {"/run": "start"}.get(cmd, cmd[1:]))
             return f"{name}: {cmd[1:]} oke. Cek /logs {name}"
@@ -441,7 +456,7 @@ def fetch_file(file_id):
     return urllib.request.urlopen(f"https://api.telegram.org/file/bot{TG_TOKEN}/{path}", timeout=60).read()
 
 
-def detect_libs(content):
+def detect_libs(content, local=()):
     import ast
     try:
         tree = ast.parse(content.decode("utf-8", "ignore"))
@@ -453,7 +468,7 @@ def detect_libs(content):
             mods |= {a.name.split(".")[0] for a in n.names}
         elif isinstance(n, ast.ImportFrom) and n.level == 0 and n.module:
             mods.add(n.module.split(".")[0])
-    return [PIPMAP.get(x, x) for x in sorted(mods) if x not in sys.stdlib_module_names]
+    return [PIPMAP.get(x, x) for x in sorted(mods) if x not in sys.stdlib_module_names and x not in local]
 
 
 def detect_var(content):
@@ -502,7 +517,7 @@ def apply_upload(name, fname, content, env, pips):
     else:
         return "Kirim .py, .zip, atau requirements.txt"
     if pips:
-        with open(app_dir / "requirements.txt", "a") as f:
+        with open(req_path(app_dir), "a") as f:
             f.write("\n" + "\n".join(pips) + "\n")
     save()
     busy.add(name)
@@ -542,6 +557,24 @@ def start_wiz(doc):
         v = detect_var(content)
         if v:
             wiz["var"] = v
+    elif low.endswith(".zip"):
+        import io, zipfile
+        try:
+            z = zipfile.ZipFile(io.BytesIO(content))
+            names = [n for n in z.namelist() if not n.endswith("/")]
+            pys = [n for n in names if n.endswith(".py")]
+            local = {os.path.basename(n)[:-3] for n in pys} | {p for n in names for p in n.split("/")[:-1]}
+            libs, texts = set(), ""
+            for n in pys:
+                t = z.read(n)
+                libs |= set(detect_libs(t, local))
+                texts += t.decode("utf-8", "ignore") + "\n"
+            wiz["auto"] = sorted(libs)
+            v = detect_var(texts.encode())
+            if v:
+                wiz["var"] = v
+        except Exception:
+            pass
     elif low.endswith(".txt"):
         wiz.update(token=None, var=None, pips=[])
     ask_next(f"File {fname} diterima.")
