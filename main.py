@@ -403,15 +403,21 @@ def delete_bot(name: str):
 
 
 # ---------- Bot Telegram: menu tombol, bahasa biasa, deteksi otomatis ----------
+import html
 import urllib.error
 
-HELP = """Cara pakai:
-- Kirim file .py atau .zip bot lu ke chat ini. Gue deteksi library dan setting-nya, lalu pasang dan jalanin sendiri.
-- Ngomong biasa: "restart bot1", "matiin semua", "kenapa bot2 mati?", "log bot1".
-- Atau pencet menu: /menu
+HELP = """📖 <b>Cara pakai</b>
+━━━━━━━━━━━━━━
+📥 <b>Tambah bot</b>
+Kirim file .py atau .zip ke chat ini. Library dan setting dideteksi otomatis, bot langsung dipasang dan dijalanin.
 
-Kalau ada library kurang, gue install otomatis lalu restart.
-/batal - batalin proses yang lagi jalan"""
+💬 <b>Ngomong biasa</b>
+"restart bot1", "matiin semua", "log bot1", "kenapa bot2 mati?"
+
+🔧 <b>Auto-fix</b>
+Library kurang? Gue install sendiri lalu restart.
+
+/menu buka menu  ·  /batal batalin proses"""
 
 TOKEN_RE = r"\d{8,10}:[A-Za-z0-9_-]{35}"
 STOP = {"ke", "di", "buat", "untuk", "library", "lib", "paket", "package", "dong", "aja", "ya", "tolong", "bot", "ulang", "lagi"}
@@ -427,8 +433,33 @@ ACTS = [
     ("add", r"tambah|nambah|bikin bot|pasang bot|upload"),
 ]
 ICON = {"running": "🟢", "stopped": "⚪", "crashed": "🔴", "installing": "🟡"}
-MAIN = [[("📋 Bot gue", "m:list"), ("➕ Tambah bot", "m:add")], [("❓ Bantuan", "m:help")]]
 state, FIX = {}, {}
+LINE = "━━━━━━━━━━━━━━"
+
+
+def esc(x):
+    return html.escape(str(x), quote=False)
+
+
+def fmt_up(s):
+    h, m = divmod(int(s or 0) // 60, 60)
+    return f"{h}j {m}m" if h else f"{m}m"
+
+
+def bar(v, mx=512, n=8):
+    k = max(1, min(n, round(v / mx * n))) if v else 0
+    return "▰" * k + "▱" * (n - k)
+
+
+def menu_rows():
+    rows = [[("📋 Bot gue", "m:list"), ("➕ Tambah bot", "m:add")], [("❓ Bantuan", "m:help")]]
+    dom = os.getenv("RAILWAY_PUBLIC_DOMAIN")
+    if dom:
+        rows[1].insert(0, ("🖥 Dashboard", f"https://{dom}"))
+    return rows
+
+
+MAIN = menu_rows()
 
 
 def tg(method, **p):
@@ -438,18 +469,27 @@ def tg(method, **p):
 
 
 def show(text, rows=None, mid=None):
-    p = {"chat_id": TG_CHAT, "text": text[:4000]}
+    p = {"chat_id": TG_CHAT, "text": text[:4000], "parse_mode": "HTML", "disable_web_page_preview": "true"}
     if rows:
-        p["reply_markup"] = json.dumps({"inline_keyboard": [[{"text": a, "callback_data": b} for a, b in row] for row in rows]})
-    if mid:
+        kb = [[{"text": a, "web_app": {"url": b}} if b.startswith("https://") else {"text": a, "callback_data": b}
+               for a, b in row] for row in rows]
+        p["reply_markup"] = json.dumps({"inline_keyboard": kb})
+    for _ in range(3):
         try:
-            return tg("editMessageText", message_id=mid, **p)
+            if mid:
+                return tg("editMessageText", message_id=mid, **p)
+            return tg("sendMessage", **p)
         except urllib.error.HTTPError as e:
-            if b"not modified" in e.read():
+            body = e.read()
+            if b"not modified" in body:
                 return
-        except Exception:
-            pass
-    return tg("sendMessage", **p)
+            if "parse_mode" in p and b"parse entities" in body:
+                p.pop("parse_mode")
+                p["text"] = html.unescape(re.sub(r"<[^>]+>", "", p["text"]))
+            elif mid:
+                mid = None
+            else:
+                raise
 
 
 def fetch_file(file_id):
@@ -569,9 +609,9 @@ def install_and_run(name):
             stop(name, "running")
             b["next_try"] = 0
             start(name)
-            show(f"✅ {name} jalan.", [[("Buka bot", f"b:{name}"), ("📜 Log", f"a:log:{name}")]])
+            show(f"🎉 <b>{esc(name)}</b> jalan!", [[("Buka bot", f"b:{name}"), ("📜 Log", f"a:log:{name}")]])
         except Exception as e:
-            show(f"❌ {name} gagal jalan: {e}")
+            show(f"❌ <b>{esc(name)}</b> gagal jalan: {esc(e)}")
     elif b.get("installed"):
         show(f"{name}: requirements terpasang.")
 
@@ -581,28 +621,46 @@ def emoji(name):
 
 
 def main_menu(mid=None):
-    show("Mau ngapain? 👇", MAIN, mid)
+    c = {}
+    for n in bots:
+        s = info(n)["status"]
+        c[s] = c.get(s, 0) + 1
+    names = (("running", "jalan"), ("crashed", "crash"), ("stopped", "berhenti"), ("installing", "install"))
+    summ = "   ".join(f"{ICON[k]} {c[k]} {lbl}" for k, lbl in names if c.get(k)) or "Belum ada bot"
+    show(f"🤖 <b>Panel Bot</b>\n{LINE}\n{summ}\n\nMau ngapain? 👇", MAIN, mid)
 
 
 def list_view(mid=None):
     if not bots:
-        return show("Belum ada bot. Kirim file .py atau .zip bot lu ke sini, gue pasang otomatis.", [[("⬅️ Menu", "m:main")]], mid)
-    rows = [[(f"{emoji(n)} {n}", f"b:{n}")] for n in bots] + [[("⬅️ Menu", "m:main")]]
-    show("Pilih bot:", rows, mid)
+        return show(f"📋 <b>Bot gue</b>\n{LINE}\nBelum ada bot. Kirim file .py atau .zip bot lu ke sini, gue pasang otomatis.", [[("⬅️ Menu", "m:main")]], mid)
+    lines, btns = [], []
+    for n in bots:
+        i = info(n)
+        run = i["status"] == "running" and i["ram_mb"] is not None
+        extra = f"{fmt_up(i['uptime'])} · {i['ram_mb']} MB" if run else i["status"]
+        lines.append(f"{ICON.get(i['status'], '⚪')} <b>{esc(n)}</b> · {extra}")
+        btns.append((f"{ICON.get(i['status'], '⚪')} {n}", f"b:{n}"))
+    rows = [btns[k:k + 2] for k in range(0, len(btns), 2)] + [[("⬅️ Menu", "m:main")]]
+    show(f"📋 <b>Bot gue</b> ({len(bots)})\n{LINE}\n" + "\n".join(lines), rows, mid)
 
 
 def bot_view(name, mid=None, note=""):
     i = info(name)
-    t = f"{ICON.get(i['status'], '⚪')} {name} ({i['status']})"
+    st = i["status"]
+    label = {"running": "jalan", "stopped": "berhenti", "crashed": "crash", "installing": "lagi install"}.get(st, st)
+    t = f"{ICON.get(st, '⚪')} <b>{esc(name)}</b> · {label}\n{LINE}\n"
+    if i["uptime"] is not None:
+        t += f"⏱ Aktif {fmt_up(i['uptime'])}\n"
     if i["ram_mb"] is not None:
-        t += f"\nRAM {i['ram_mb']} MB, aktif {(i['uptime'] or 0) // 60} menit"
+        t += f"💾 RAM {bar(i['ram_mb'])} {i['ram_mb']} MB\n"
     if i["restarts"]:
-        t += f"\nRestart otomatis: {i['restarts']}x"
+        t += f"🔁 Restart otomatis {i['restarts']}x\n"
     if i["last_error"]:
-        t += f"\nError terakhir: {i['last_error'][:150]}"
+        t += f"\n⚠️ <b>Error terakhir</b>\n<blockquote>{esc(i['last_error'][:160])}</blockquote>"
     if note:
-        t = note + "\n\n" + t
-    rows = [[("▶️ Jalanin", f"a:run:{name}"), ("⏹ Stop", f"a:stop:{name}"), ("🔄 Restart", f"a:restart:{name}")],
+        t = f"{esc(note)}\n\n" + t
+    ctrl = [("⏹ Stop", f"a:stop:{name}"), ("🔄 Restart", f"a:restart:{name}")] if st in ("running", "crashed") else [("▶️ Jalanin", f"a:run:{name}")]
+    rows = [ctrl,
             [("📜 Log", f"a:log:{name}"), ("🩺 Cek masalah", f"a:diag:{name}")],
             [("📦 Library", f"a:pip:{name}"), ("⚙️ Env", f"a:env:{name}"), ("🔑 Token", f"a:tok:{name}")],
             [("🗑 Hapus", f"a:del:{name}"), ("⬅️ Kembali", "m:list")]]
@@ -618,8 +676,8 @@ def do(name, action, mid=None, note=None):
 
 
 def log_view(name, mid=None):
-    body = "\n".join(list(logs.get(name, []))[-20:])[-3500:] or "Log kosong"
-    show(f"📜 {name}\n{body}", [[("↻ Refresh", f"a:log:{name}"), ("⬅️ Bot", f"b:{name}")]], mid)
+    body = esc("\n".join(list(logs.get(name, []))[-20:])[-2500:]) or "Log kosong"
+    show(f"📜 <b>Log {esc(name)}</b>\n<pre>{body}</pre>", [[("↻ Refresh", f"a:log:{name}"), ("⬅️ Bot", f"b:{name}")]], mid)
 
 
 def diag_view(name, mid=None):
@@ -630,7 +688,7 @@ def diag_view(name, mid=None):
     if m:
         mod = m.group(1).split(".")[0]
         FIX[name] = PIPMAP.get(mod, mod)
-        tips.append(f"Library {FIX[name]} belum terpasang.")
+        tips.append(f"Library <b>{esc(FIX[name])}</b> belum terpasang.")
         rows.append([(f"📦 Install {FIX[name]}", f"a:fix:{name}")])
     if re.search(r"Unauthorized|InvalidToken|Invalid token", blob):
         tips.append("Token ditolak Telegram (salah atau udah di-revoke).")
@@ -639,7 +697,7 @@ def diag_view(name, mid=None):
         tips.append("Token ini lagi dipakai di tempat lain (bot jalan dobel). Matiin yang satunya.")
     k = re.search(r"KeyError: '(\w+)'", blob)
     if k:
-        tips.append(f"Variabel {k.group(1)} belum diisi.")
+        tips.append(f"Variabel <b>{esc(k.group(1))}</b> belum diisi.")
         rows.append([("⚙️ Isi env", f"a:env:{name}")])
     if re.search(r"NetworkError|TimedOut|ConnectError|ConnectionError", blob):
         tips.append("Koneksi ke Telegram lagi bermasalah, biasanya sementara.")
@@ -649,11 +707,11 @@ def diag_view(name, mid=None):
         if i["status"] == "running":
             tips.append("Bot hidup dan nyambung. Kalau gak bales, kemungkinan logika script-nya (perintah yang dikenal, ID admin, atau env belum diisi).")
         elif b.get("last_error"):
-            tips.append("Error terakhir: " + b["last_error"][:200])
+            tips.append("Error terakhir: " + esc(b["last_error"][:200]))
         else:
             tips.append("Gak ada error di log.")
     rows += [[("🔄 Restart", f"a:restart:{name}"), ("📜 Log", f"a:log:{name}")], [("⬅️ Bot", f"b:{name}")]]
-    show(f"🩺 {name} ({i['status']})\n\n" + "\n".join("• " + t for t in tips), rows, mid)
+    show(f"🩺 <b>Cek {esc(name)}</b> · {i['status']}\n{LINE}\n" + "\n".join("▸ " + x for x in tips), rows, mid)
 
 
 def pip_libs(name, libs):
@@ -674,9 +732,9 @@ def go(name, fname, content, env, pips, tvars, token=None):
             env[v] = token
     err = apply_upload(name, fname, content, env, pips, tvars)
     if err:
-        return show(err, MAIN)
+        return show(esc(err), MAIN)
     lib = "dari requirements.txt" if fname == "requirements.txt" else (", ".join(pips) or "gak ada tambahan")
-    show(f"✅ {name} ditambah\n📦 Library: {lib}\n🔑 Env: {', '.join(env) or '-'}\n\nLagi install dan jalanin. Kalau ada library kurang, gue install sendiri.",
+    show(f"✅ <b>{esc(name)}</b> ditambah\n{LINE}\n📦 {esc(lib)}\n🔑 {esc(', '.join(env) or '-')}\n\n⏳ Lagi install dan jalanin. Kalau ada library kurang, gue install sendiri.",
          [[("Buka bot", f"b:{name}"), ("📜 Log", f"a:log:{name}")]])
 
 
@@ -719,7 +777,7 @@ def on_file(m):
     if not token and not an["has_token"] and not any("TOKEN" in k.upper() for k in env):
         state.clear()
         state.update(kind="token", name=name, fname=fname, content=content, env=env, pips=pips, tvars=an["tvars"])
-        return show(f"📥 {fname} diterima. Bot-nya gue namain {name}.\nSisa 1 hal: kirim token bot-nya (dari BotFather).",
+        return show(f"📥 <b>{esc(fname)}</b> diterima\nNama bot: <b>{esc(name)}</b>\n{LINE}\nSisa 1 hal: kirim token bot-nya (dari BotFather).",
                     [[("Lewati, gak butuh token", "t:skip"), ("Batal", "m:cancel")]])
     go(name, fname, content, env, pips, an["tvars"], token)
 
@@ -825,7 +883,7 @@ def nlu(text):
                     act(x, {"run": "start"}.get(a, a))
                     res.append(f"{x}: ok")
                 except HTTPException as e:
-                    res.append(f"{x}: {e.detail}")
+                    res.append(f"{esc(x)}: {esc(e.detail)}")
             return show("\n".join(res), [[("📋 Bot gue", "m:list")]])
         return do(n, a)
     if a in ("diag", "log", "del"):
@@ -878,7 +936,7 @@ def command(text):
             return show(f"{name} dihapus", MAIN)
         show("Perintah tidak dikenal. Coba /menu")
     except HTTPException as e:
-        show(f"Gagal: {e.detail}")
+        show(f"Gagal: {esc(e.detail)}")
 
 
 def on_callback(cb):
@@ -943,7 +1001,7 @@ def tg_loop():
                         except Exception:
                             pass
                 except Exception as e:
-                    show(f"Error: {e}")
+                    show(f"Error: {esc(e)}")
         except Exception:
             time.sleep(5)
 
